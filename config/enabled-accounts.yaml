@@ -1,0 +1,13 @@
+# Accounts eligible for scheduled and default manual cleanup.
+# Credentials for these names must exist in CLOUD_ACCOUNTS_CREDENTIALS.
+# Remove an account from this list to disable cleanup without updating the secret.
+accounts:
+  - avinash
+  - pavan
+  - balaji
+  - vishal
+  - govardhan
+  - zeeshan
+  - nandan
+  - plf-oci
+  # - st-oci

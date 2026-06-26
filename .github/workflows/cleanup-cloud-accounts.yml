@@ -1,0 +1,132 @@
+name: Cleanup Cloud Accounts
+
+on:
+  schedule:
+    - cron: '30 18 * * *'   # 00:00 IST (UTC+5:30)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview deletions without acting'
+        type: boolean
+        default: false
+      account:
+        description: 'Single account name (empty = all enabled accounts)'
+        type: string
+        required: false
+      region:
+        description: 'Limit to a single cloud region'
+        type: string
+        required: false
+
+concurrency:
+  group: cloud-cleanup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      accounts: ${{ steps.parse.outputs.accounts }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse enabled accounts
+        id: parse
+        env:
+          INPUT_ACCOUNT: ${{ github.event.inputs.account || '' }}
+        run: |
+          set -euo pipefail
+          ACCOUNTS=$(python3 -c "
+          import json, os, sys
+
+          path = 'config/enabled-accounts.yaml'
+          enabled = []
+          in_accounts = False
+          with open(path) as f:
+              for line in f:
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith('#'):
+                      continue
+                  if stripped == 'accounts:':
+                      in_accounts = True
+                      continue
+                  if in_accounts and stripped.startswith('- '):
+                      enabled.append(stripped[2:].strip())
+
+          target = os.environ.get('INPUT_ACCOUNT', '').strip()
+          if target:
+              if target not in enabled:
+                  print(f\"Error: account '{target}' is not in config/enabled-accounts.yaml\", file=sys.stderr)
+                  sys.exit(1)
+              enabled = [target]
+
+          if not enabled:
+              print('Error: no enabled accounts in config/enabled-accounts.yaml', file=sys.stderr)
+              sys.exit(1)
+
+          print(json.dumps(enabled))
+          ")
+          echo "accounts=${ACCOUNTS}" >> "$GITHUB_OUTPUT"
+          echo "Accounts to purge: ${ACCOUNTS}"
+
+  purge:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        account: ${{ fromJson(needs.prepare.outputs.accounts) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write credentials file
+        env:
+          CLOUD_ACCOUNTS_CREDENTIALS: ${{ secrets.CLOUD_ACCOUNTS_CREDENTIALS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLOUD_ACCOUNTS_CREDENTIALS:-}" ]]; then
+            echo "Error: CLOUD_ACCOUNTS_CREDENTIALS secret is not set" >&2
+            exit 1
+          fi
+          printf '%s' "$CLOUD_ACCOUNTS_CREDENTIALS" > /tmp/cloud-accounts.json
+          chmod 600 /tmp/cloud-accounts.json
+          python3 -c "
+          import json, sys
+          with open('/tmp/cloud-accounts.json') as f:
+              data = json.load(f)
+          if '${{ matrix.account }}' not in data.get('accounts', {}):
+              print('Error: account not found in CLOUD_ACCOUNTS_CREDENTIALS', file=sys.stderr)
+              sys.exit(1)
+          "
+
+      - name: Install OCI CLI
+        run: pip install oci-cli
+
+      - name: Purge account
+        env:
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          INPUT_REGION: ${{ github.event.inputs.region || '' }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+            --account "${{ matrix.account }}"
+            --credentials-file /tmp/cloud-accounts.json
+            --yes
+          )
+          if [[ "$INPUT_DRY_RUN" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          if [[ -n "$INPUT_REGION" ]]; then
+            ARGS+=(--region "$INPUT_REGION")
+          fi
+          ./scripts/purge-cloud-account.sh "${ARGS[@]}"
+
+      - name: Remove credentials file
+        if: always()
+        run: |
+          shred -u /tmp/cloud-accounts.json 2>/dev/null || rm -f /tmp/cloud-accounts.json
