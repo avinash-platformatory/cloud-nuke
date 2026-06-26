@@ -103,11 +103,14 @@ if provider not in ('aws', 'oci'):
 
 provider_json = {'provider': provider, 'configuration': acct.get('credentials', {})}
 home_region = acct.get('home_region', '') or ''
+default_region = acct.get('default_region', '') or ''
 print(json.dumps(provider_json))
 print(home_region)
+print(default_region)
 ")
 PROVIDER_JSON="${_cred_lines[0]}"
 OCI_HOME_REGION="${_cred_lines[1]:-}"
+AWS_ACCOUNT_DEFAULT_REGION="${_cred_lines[2]:-}"
 
 PROVIDER_TYPE=$(echo "$PROVIDER_JSON" | py "import json,sys; print(json.load(sys.stdin).get('provider',''))")
 echo "  Provider type: $PROVIDER_TYPE"
@@ -121,6 +124,10 @@ run_aws() {
   AWS_SECRET_ACCESS_KEY=$(echo "$PROVIDER_JSON" | py "import json,sys; print(json.load(sys.stdin)['configuration']['aws_access_secret'])")
   AWS_SESSION_TOKEN=$(echo "$PROVIDER_JSON" | py "import json,sys; print(json.load(sys.stdin)['configuration'].get('aws_session_token') or '')")
   [[ -z "$AWS_SESSION_TOKEN" ]] && unset AWS_SESSION_TOKEN
+
+  # AWS CLI v2 requires a default region (GHA runners have no aws configure).
+  export AWS_DEFAULT_REGION="${TARGET_REGION:-${AWS_ACCOUNT_DEFAULT_REGION:-us-east-1}}"
+  export AWS_REGION="$AWS_DEFAULT_REGION"
 
   if ! aws sts get-caller-identity --output json &>/dev/null; then
     echo "Error: AWS credentials for '$ACCOUNT_NAME' are invalid or expired." >&2; exit 1
@@ -138,6 +145,10 @@ run_aws() {
     )
   fi
   [[ ${#REGIONS[@]} -eq 0 ]] && { echo "Error: no regions found." >&2; exit 1; }
+  if [[ -z "$TARGET_REGION" ]]; then
+    export AWS_DEFAULT_REGION="${REGIONS[0]}"
+    export AWS_REGION="$AWS_DEFAULT_REGION"
+  fi
   echo "  Regions: ${REGIONS[*]}"
 
   echo ""

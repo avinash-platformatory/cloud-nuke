@@ -16,6 +16,7 @@ Create repository secret `CLOUD_ACCOUNTS_CREDENTIALS` with JSON like [`config/cr
   "accounts": {
     "sub1": {
       "provider": "aws",
+      "default_region": "ap-south-1",
       "credentials": {
         "aws_access_key": "AKIA...",
         "aws_access_secret": "..."
@@ -36,6 +37,7 @@ Create repository secret `CLOUD_ACCOUNTS_CREDENTIALS` with JSON like [`config/cr
 ```
 
 - Add or remove accounts in the secret when credentials change.
+- `default_region` is optional for AWS; bootstrap region for CLI calls when `--region` is not set (defaults to `us-east-1`).
 - `home_region` is optional for OCI; if omitted, the script probes common regions.
 
 ### 2. Enabled accounts
