@@ -104,6 +104,9 @@ jobs:
               sys.exit(1)
           "
 
+      - name: Install Azure CLI
+        run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
       - name: Install OCI CLI
         run: pip install oci-cli
 

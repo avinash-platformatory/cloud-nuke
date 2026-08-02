@@ -3,7 +3,7 @@ set -euo pipefail
 
 # purge-cloud-account.sh
 #
-# Nuke all billable resources in a cloud account. Supports AWS and OCI.
+# Nuke all billable resources in a cloud account. Supports AWS, OCI, and Azure.
 # Credentials are loaded from a JSON credentials file (see config/credentials.example.json).
 #
 # AWS deletes (per region, in parallel):
@@ -19,6 +19,15 @@ set -euo pipefail
 #   OCIR repos (incl. public)
 #   Global: object storage buckets
 #
+# Azure deletes (entire subscription, or single --region/location):
+#   AKS, VMs, VMSS, load balancers, Application Gateways, NAT gateways,
+#   public IPs, VNets + NSGs/route tables/private endpoints, managed disks,
+#   snapshots, ACR, SQL/PostgreSQL/MySQL/Cosmos, Redis, NetApp, storage
+#   accounts, Container Instances/Apps, App Services, Functions, Firewall,
+#   Bastion, VPN gateways, Disk Encryption Sets; then resource groups;
+#   soft-deleted Key Vaults purged.
+#   Entra ID / role assignments / custom RBAC roles are NEVER deleted.
+#
 # Other IAM *customer-managed policies* are never deleted (AWS or OCI): not a direct
 # billing line item; safe to leave for human / IaC cleanup. Exception: policies
 # under /kafka-streamtime/ are deleted with their users (Fleet Manager S3 access).
@@ -27,6 +36,7 @@ set -euo pipefail
 # Usage:
 #   ./scripts/purge-cloud-account.sh --account sub1 --credentials-file /path/to/creds.json
 #   ./scripts/purge-cloud-account.sh --account oci-lab --credentials-file creds.json --dry-run
+#   ./scripts/purge-cloud-account.sh --account azure-lab --credentials-file creds.json --yes
 #   ./scripts/purge-cloud-account.sh --account sub1 --credentials-file creds.json --region us-east-1 --yes
 #
 # Options:
@@ -97,7 +107,7 @@ if '$ACCOUNT_NAME' not in accounts:
 
 acct = accounts['$ACCOUNT_NAME']
 provider = acct.get('provider', '')
-if provider not in ('aws', 'oci'):
+if provider not in ('aws', 'oci', 'azure'):
     print(f\"Error: unsupported provider '{provider}' for account '$ACCOUNT_NAME'\", file=sys.stderr)
     sys.exit(1)
 
@@ -731,13 +741,285 @@ EOF
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Azure
+# ══════════════════════════════════════════════════════════════════════════════
+run_azure() {
+  local SUBSCRIPTION_ID TENANT_ID CLIENT_ID CLIENT_SECRET
+  SUBSCRIPTION_ID=$(echo "$PROVIDER_JSON" | py "import json,sys; print(json.load(sys.stdin)['configuration']['subscription_id'])")
+  TENANT_ID=$(echo "$PROVIDER_JSON"      | py "import json,sys; print(json.load(sys.stdin)['configuration']['tenant_id'])")
+  CLIENT_ID=$(echo "$PROVIDER_JSON"      | py "import json,sys; print(json.load(sys.stdin)['configuration']['client_id'])")
+  CLIENT_SECRET=$(echo "$PROVIDER_JSON"  | py "import json,sys; print(json.load(sys.stdin)['configuration']['client_secret'])")
+
+  echo "  Logging in with service principal..."
+  if ! az login --service-principal \
+      -u "$CLIENT_ID" \
+      -p "$CLIENT_SECRET" \
+      --tenant "$TENANT_ID" \
+      --output none 2>/dev/null; then
+    echo "Error: Azure credentials for '$ACCOUNT_NAME' are invalid or expired." >&2
+    exit 1
+  fi
+  if ! az account set --subscription "$SUBSCRIPTION_ID" 2>/dev/null; then
+    echo "Error: cannot set subscription '$SUBSCRIPTION_ID' for '$ACCOUNT_NAME'." >&2
+    exit 1
+  fi
+  if ! az account show --output json &>/dev/null; then
+    echo "Error: Azure account validation failed for '$ACCOUNT_NAME'." >&2
+    exit 1
+  fi
+  echo "  Credentials validated. Subscription: $SUBSCRIPTION_ID"
+
+  # --region maps to Azure location (e.g. eastus)
+  local LOCATION_FILTER="${TARGET_REGION:-}"
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Account:            $ACCOUNT_NAME  (azure)"
+  echo "  Subscription:       $SUBSCRIPTION_ID"
+  echo "  Location filter:    ${LOCATION_FILTER:-all}"
+  echo "  Dry run:            $DRY_RUN"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [[ "$DRY_RUN" == "false" && "$AUTO_YES" == "false" ]]; then
+    read -r -p "⚠  DELETE ALL billable resources in $ACCOUNT_NAME (Azure subscription). Type 'yes': " C
+    [[ "$C" == "yes" ]] || { echo "Aborted."; exit 0; }
+  fi
+
+  # Helper: list resource IDs of a given type, optionally filtered by location
+  azure_list_ids() {
+    local TYPE="$1"
+    if [[ -n "$LOCATION_FILTER" ]]; then
+      az resource list --resource-type "$TYPE" --query "[?location=='$LOCATION_FILTER'].id" -o tsv 2>/dev/null || true
+    else
+      az resource list --resource-type "$TYPE" --query "[].id" -o tsv 2>/dev/null || true
+    fi
+  }
+
+  azure_delete_ids() {
+    local LABEL="$1"
+    shift
+    local ID
+    for ID in "$@"; do
+      [[ -z "$ID" ]] && continue
+      echo "  [azure] $LABEL: $ID"
+      [[ "$DRY_RUN" == "false" ]] && az resource delete --ids "$ID" 2>/dev/null || true
+    done
+  }
+
+  azure_delete_type() {
+    local LABEL="$1" TYPE="$2"
+    local IDS
+    mapfile -t IDS < <(azure_list_ids "$TYPE")
+    [[ ${#IDS[@]} -eq 0 ]] && return 0
+    azure_delete_ids "$LABEL" "${IDS[@]}"
+  }
+
+  # ── 1. Remove resource locks (block RG/resource deletes) ───────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  Azure resource locks"; echo "══════════════════════════════════════════════════"
+  for LOCK_ID in $(az lock list --subscription "$SUBSCRIPTION_ID" --query "[].id" -o tsv 2>/dev/null || true); do
+    [[ -z "$LOCK_ID" ]] && continue
+    echo "  [azure] lock: $LOCK_ID"
+    [[ "$DRY_RUN" == "false" ]] && az lock delete --ids "$LOCK_ID" 2>/dev/null || true
+  done
+
+  # ── 2. AKS clusters first (create MC_* node RGs) ───────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  Azure AKS clusters"; echo "══════════════════════════════════════════════════"
+  local AKS_LINES
+  if [[ -n "$LOCATION_FILTER" ]]; then
+    mapfile -t AKS_LINES < <(az aks list --query "[?location=='$LOCATION_FILTER'].[resourceGroup,name]" -o tsv 2>/dev/null || true)
+  else
+    mapfile -t AKS_LINES < <(az aks list --query "[].[resourceGroup,name]" -o tsv 2>/dev/null || true)
+  fi
+  local AKS_PIDS=()
+  for LINE in "${AKS_LINES[@]:-}"; do
+    [[ -z "$LINE" ]] && continue
+    local RG NAME
+    RG=$(echo "$LINE" | awk '{print $1}')
+    NAME=$(echo "$LINE" | awk '{print $2}')
+    echo "  [azure] AKS: $RG/$NAME"
+    if [[ "$DRY_RUN" == "false" ]]; then
+      (az aks delete --resource-group "$RG" --name "$NAME" --yes --no-wait 2>/dev/null || true) &
+      AKS_PIDS+=($!)
+    fi
+  done
+  [[ ${#AKS_PIDS[@]} -gt 0 ]] && wait "${AKS_PIDS[@]}" 2>/dev/null || true
+  # Wait until AKS clusters are gone (up to ~30 min)
+  if [[ "$DRY_RUN" == "false" && ${#AKS_LINES[@]} -gt 0 ]]; then
+    local WAIT_I=0
+    while [[ $WAIT_I -lt 60 ]]; do
+      local REMAINING
+      if [[ -n "$LOCATION_FILTER" ]]; then
+        REMAINING=$(az aks list --query "[?location=='$LOCATION_FILTER'] | length(@)" -o tsv 2>/dev/null || echo 0)
+      else
+        REMAINING=$(az aks list --query "length(@)" -o tsv 2>/dev/null || echo 0)
+      fi
+      [[ "${REMAINING:-0}" == "0" ]] && break
+      echo "  [azure] waiting for AKS deletion ($REMAINING remaining)..."
+      sleep 30
+      WAIT_I=$((WAIT_I + 1))
+    done
+  fi
+
+  # ── 3. Typed billable sweep (dependency-friendly order) ────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  Azure typed resource sweep"; echo "══════════════════════════════════════════════════"
+
+  # Compute
+  azure_delete_type "VMSS" "Microsoft.Compute/virtualMachineScaleSets"
+  azure_delete_type "VM" "Microsoft.Compute/virtualMachines"
+  azure_delete_type "availability set" "Microsoft.Compute/availabilitySets"
+  azure_delete_type "image" "Microsoft.Compute/images"
+  azure_delete_type "gallery" "Microsoft.Compute/galleries"
+  azure_delete_type "snapshot" "Microsoft.Compute/snapshots"
+  azure_delete_type "disk" "Microsoft.Compute/disks"
+  azure_delete_type "disk encryption set" "Microsoft.Compute/diskEncryptionSets"
+
+  # Containers / PaaS
+  azure_delete_type "container instance" "Microsoft.ContainerInstance/containerGroups"
+  azure_delete_type "container app" "Microsoft.App/containerApps"
+  azure_delete_type "container app env" "Microsoft.App/managedEnvironments"
+  azure_delete_type "ACR" "Microsoft.ContainerRegistry/registries"
+  azure_delete_type "function app" "Microsoft.Web/sites"
+  azure_delete_type "app service plan" "Microsoft.Web/serverFarms"
+
+  # Databases / cache
+  azure_delete_type "SQL server" "Microsoft.Sql/servers"
+  azure_delete_type "PostgreSQL flexible" "Microsoft.DBforPostgreSQL/flexibleServers"
+  azure_delete_type "MySQL flexible" "Microsoft.DBforMySQL/flexibleServers"
+  azure_delete_type "Cosmos DB" "Microsoft.DocumentDB/databaseAccounts"
+  azure_delete_type "Redis" "Microsoft.Cache/Redis"
+  azure_delete_type "NetApp account" "Microsoft.NetApp/netAppAccounts"
+
+  # Networking (LBs / gateways before VNets)
+  azure_delete_type "application gateway" "Microsoft.Network/applicationGateways"
+  azure_delete_type "load balancer" "Microsoft.Network/loadBalancers"
+  azure_delete_type "Azure Firewall" "Microsoft.Network/azureFirewalls"
+  azure_delete_type "firewall policy" "Microsoft.Network/firewallPolicies"
+  azure_delete_type "Bastion" "Microsoft.Network/bastionHosts"
+  azure_delete_type "VPN gateway" "Microsoft.Network/virtualNetworkGateways"
+  azure_delete_type "local network gateway" "Microsoft.Network/localNetworkGateways"
+  azure_delete_type "connection" "Microsoft.Network/connections"
+  azure_delete_type "NAT gateway" "Microsoft.Network/natGateways"
+  azure_delete_type "public IP" "Microsoft.Network/publicIPAddresses"
+  azure_delete_type "public IP prefix" "Microsoft.Network/publicIPPrefixes"
+  azure_delete_type "private endpoint" "Microsoft.Network/privateEndpoints"
+  azure_delete_type "private DNS zone" "Microsoft.Network/privateDnsZones"
+  azure_delete_type "DNS zone" "Microsoft.Network/dnszones"
+  azure_delete_type "NIC" "Microsoft.Network/networkInterfaces"
+  azure_delete_type "NSG" "Microsoft.Network/networkSecurityGroups"
+  azure_delete_type "route table" "Microsoft.Network/routeTables"
+  azure_delete_type "VNet peering" "Microsoft.Network/virtualNetworks/virtualNetworkPeerings"
+  azure_delete_type "VNet" "Microsoft.Network/virtualNetworks"
+
+  # Storage accounts — empty blobs best-effort then delete account
+  echo "  [azure] sweeping storage accounts..."
+  local SA_LINES
+  if [[ -n "$LOCATION_FILTER" ]]; then
+    mapfile -t SA_LINES < <(az storage account list --query "[?location=='$LOCATION_FILTER'].[resourceGroup,name]" -o tsv 2>/dev/null || true)
+  else
+    mapfile -t SA_LINES < <(az storage account list --query "[].[resourceGroup,name]" -o tsv 2>/dev/null || true)
+  fi
+  for LINE in "${SA_LINES[@]:-}"; do
+    [[ -z "$LINE" ]] && continue
+    local SA_RG SA_NAME
+    SA_RG=$(echo "$LINE" | awk '{print $1}')
+    SA_NAME=$(echo "$LINE" | awk '{print $2}')
+    echo "  [azure] storage account: $SA_RG/$SA_NAME"
+    if [[ "$DRY_RUN" == "false" ]]; then
+      # Best-effort: delete blob containers (may fail without data-plane perms)
+      for CONTAINER in $(az storage container list --account-name "$SA_NAME" --auth-mode login --query "[].name" -o tsv 2>/dev/null || true); do
+        az storage container delete --account-name "$SA_NAME" --name "$CONTAINER" --auth-mode login --yes 2>/dev/null || true
+      done
+      az storage account delete --resource-group "$SA_RG" --name "$SA_NAME" --yes 2>/dev/null || true
+    fi
+  done
+
+  # Catch-all: any remaining non-IAM ARM resources of common billable types
+  # (skipped when doing full RG delete below; useful for --region mode)
+  if [[ -n "$LOCATION_FILTER" ]]; then
+    echo "  [azure] catch-all resources in location $LOCATION_FILTER..."
+    for RID in $(az resource list --query "[?location=='$LOCATION_FILTER'].id" -o tsv 2>/dev/null || true); do
+      [[ -z "$RID" ]] && continue
+      # Skip role assignments / managed identities at Entra level — resource IDs
+      # for userAssignedIdentities are ARM resources; leave them (no direct cost).
+      case "$RID" in
+        */providers/Microsoft.ManagedIdentity/*) continue ;;
+        */providers/Microsoft.Authorization/*) continue ;;
+      esac
+      echo "  [azure] leftover: $RID"
+      [[ "$DRY_RUN" == "false" ]] && az resource delete --ids "$RID" 2>/dev/null || true
+    done
+  fi
+
+  # ── 4. Delete all resource groups (full-subscription mode only) ────────────
+  if [[ -z "$LOCATION_FILTER" ]]; then
+    echo ""; echo "══════════════════════════════════════════════════"
+    echo "  Azure resource groups"; echo "══════════════════════════════════════════════════"
+    local RGS
+    mapfile -t RGS < <(az group list --query "[].name" -o tsv 2>/dev/null || true)
+    local RG_PIDS=() RG_ACTIVE=0
+    for RG in "${RGS[@]:-}"; do
+      [[ -z "$RG" ]] && continue
+      echo "  [azure] resource group: $RG"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        (
+          az group delete --name "$RG" --yes --no-wait 2>/dev/null || true
+        ) &
+        RG_PIDS+=($!)
+        RG_ACTIVE=$((RG_ACTIVE + 1))
+        # Cap parallelism to reduce ARM throttling
+        if [[ $RG_ACTIVE -ge 5 ]]; then
+          wait "${RG_PIDS[@]}" 2>/dev/null || true
+          RG_PIDS=()
+          RG_ACTIVE=0
+        fi
+      fi
+    done
+    [[ ${#RG_PIDS[@]} -gt 0 ]] && wait "${RG_PIDS[@]}" 2>/dev/null || true
+
+    if [[ "$DRY_RUN" == "false" && ${#RGS[@]} -gt 0 ]]; then
+      local WAIT_I=0
+      while [[ $WAIT_I -lt 90 ]]; do
+        local REMAINING
+        REMAINING=$(az group list --query "length(@)" -o tsv 2>/dev/null || echo 0)
+        [[ "${REMAINING:-0}" == "0" ]] && break
+        echo "  [azure] waiting for resource group deletion ($REMAINING remaining)..."
+        sleep 30
+        WAIT_I=$((WAIT_I + 1))
+      done
+    fi
+  else
+    echo "  [azure] skipping resource group deletion (--region set)"
+  fi
+
+  # ── 5. Soft-deleted Key Vaults ─────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  Azure soft-deleted Key Vaults"; echo "══════════════════════════════════════════════════"
+  for KV in $(az keyvault list-deleted --query "[].name" -o tsv 2>/dev/null || true); do
+    [[ -z "$KV" ]] && continue
+    if [[ -n "$LOCATION_FILTER" ]]; then
+      local KV_LOC
+      KV_LOC=$(az keyvault list-deleted --query "[?name=='$KV'].properties.location | [0]" -o tsv 2>/dev/null || true)
+      [[ "$KV_LOC" != "$LOCATION_FILTER" ]] && continue
+    fi
+    echo "  [azure] purge Key Vault: $KV"
+    [[ "$DRY_RUN" == "false" ]] && az keyvault purge --name "$KV" 2>/dev/null || true
+  done
+
+  # Entra ID apps, service principals, role assignments, and custom RBAC roles
+  # are intentionally NOT deleted.
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Dispatch
 # ══════════════════════════════════════════════════════════════════════════════
 case "$PROVIDER_TYPE" in
-  aws) require_cmd aws; run_aws ;;
-  oci) require_cmd oci; run_oci ;;
+  aws)   require_cmd aws; run_aws ;;
+  oci)   require_cmd oci; run_oci ;;
+  azure) require_cmd az;  run_azure ;;
   *)
-    echo "Error: unsupported provider type '$PROVIDER_TYPE'. Only 'aws' and 'oci' are supported." >&2
+    echo "Error: unsupported provider type '$PROVIDER_TYPE'. Only 'aws', 'oci', and 'azure' are supported." >&2
     exit 1 ;;
 esac
 

@@ -1,6 +1,6 @@
 # Cloud Nuke
 
-Scheduled and on-demand cleanup of billable cloud resources in AWS and OCI accounts.
+Scheduled and on-demand cleanup of billable cloud resources in AWS, OCI, and Azure accounts.
 
 Credentials live in a GitHub secret. Which accounts are purged is controlled by a versioned config file in this repo — remove an account from the list to disable cleanup without rotating secrets.
 
@@ -31,6 +31,15 @@ Create repository secret `CLOUD_ACCOUNTS_CREDENTIALS` with JSON like [`config/cr
         "fingerprint": "aa:bb:cc:...",
         "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
       }
+    },
+    "azure-lab": {
+      "provider": "azure",
+      "credentials": {
+        "subscription_id": "00000000-0000-0000-0000-000000000000",
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "client_id": "22222222-2222-2222-2222-222222222222",
+        "client_secret": "..."
+      }
     }
   }
 }
@@ -39,6 +48,7 @@ Create repository secret `CLOUD_ACCOUNTS_CREDENTIALS` with JSON like [`config/cr
 - Add or remove accounts in the secret when credentials change.
 - `default_region` is optional for AWS; bootstrap region for CLI calls when `--region` is not set (defaults to `us-east-1`).
 - `home_region` is optional for OCI; if omitted, the script probes common regions.
+- Azure uses a service principal (`subscription_id`, `tenant_id`, `client_id`, `client_secret`). Cleanup covers the **entire subscription**.
 
 ### 2. Enabled accounts
 
@@ -75,13 +85,15 @@ Interactive runs prompt for `yes` before deleting. Pass `--yes` to skip (require
 
 See script header in [`scripts/purge-cloud-account.sh`](scripts/purge-cloud-account.sh). Summary:
 
-**AWS (per region + global):** EKS, EC2, ASGs, load balancers, NAT gateways, EIPs, VPCs, EBS, ECR, RDS, ElastiCache, EFS, S3, IAM roles/instance profiles, OIDC providers. Customer-managed IAM policies are **not** deleted.
+**AWS (per region + global):** EKS, EC2, ASGs, load balancers, NAT gateways, EIPs, VPCs, EBS, ECR, RDS, ElastiCache, EFS, S3, IAM roles/instance profiles, OIDC providers. Customer-managed IAM policies are **not** deleted (except `/kafka-streamtime/`).
 
 **OCI (per region/compartment + global):** OKE, compute, LBs/NLBs, block/boot volumes, File Storage, Autonomous DBs, VCNs, object storage buckets, OCIR repos, Fleet Manager dynamic groups. IAM policies are **not** deleted.
+
+**Azure (entire subscription, or single `--region` location):** Resource locks removed; AKS; VMs/VMSS; load balancers and Application Gateways; NAT gateways and public IPs; VNets and related networking; managed disks/snapshots; ACR; SQL/PostgreSQL/MySQL/Cosmos; Redis; NetApp; storage accounts; Container Instances/Apps; App Services/Functions; Firewall/Bastion/VPN; then all resource groups; soft-deleted Key Vaults purged. Entra ID apps, service principals, role assignments, and custom RBAC roles are **not** deleted.
 
 ## Safety
 
 - Scheduled runs perform **real deletions**. The enabled-accounts config is the primary guardrail.
-- Use dedicated cleanup IAM/OCI users with delete permissions scoped to test accounts only.
+- Use dedicated cleanup IAM/OCI/Azure SP users with delete permissions scoped to test accounts only.
 - Workflow uses concurrency control to prevent overlapping purges.
 - Manual dispatch supports `dry_run` and single-account targeting.
