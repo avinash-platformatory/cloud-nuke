@@ -1,6 +1,6 @@
 # Cloud Nuke
 
-Scheduled and on-demand cleanup of billable cloud resources in AWS, OCI, and Azure accounts.
+Scheduled and on-demand cleanup of billable cloud resources in AWS, OCI, Azure, and GCP accounts.
 
 Credentials live in a GitHub secret. Which accounts are purged is controlled by a versioned config file in this repo — remove an account from the list to disable cleanup without rotating secrets.
 
@@ -40,6 +40,12 @@ Create repository secret `CLOUD_ACCOUNTS_CREDENTIALS` with JSON like [`config/cr
         "client_id": "22222222-2222-2222-2222-222222222222",
         "client_secret": "..."
       }
+    },
+    "gcp-lab": {
+      "provider": "gcp",
+      "credentials": {
+        "service_account_key": "{\"type\":\"service_account\",\"project_id\":\"my-project\",...}"
+      }
     }
   }
 }
@@ -49,6 +55,7 @@ Create repository secret `CLOUD_ACCOUNTS_CREDENTIALS` with JSON like [`config/cr
 - `default_region` is optional for AWS; bootstrap region for CLI calls when `--region` is not set (defaults to `us-east-1`).
 - `home_region` is optional for OCI; if omitted, the script probes common regions.
 - Azure uses a service principal (`subscription_id`, `tenant_id`, `client_id`, `client_secret`). Cleanup covers the **entire subscription**.
+- GCP uses a service account key JSON string (`service_account_key`). Project ID is taken from the key. Cleanup covers the **entire project**.
 
 ### 2. Enabled accounts
 
@@ -91,9 +98,11 @@ See script header in [`scripts/purge-cloud-account.sh`](scripts/purge-cloud-acco
 
 **Azure (entire subscription, or single `--region` location):** Resource locks removed; AKS; VMs/VMSS; load balancers and Application Gateways; NAT gateways and public IPs; VNets and related networking; managed disks/snapshots; ACR; SQL/PostgreSQL/MySQL/Cosmos; Redis; NetApp; storage accounts; Container Instances/Apps; App Services/Functions; Firewall/Bastion/VPN; then all resource groups; soft-deleted Key Vaults purged. Entra ID apps, service principals, role assignments, and custom RBAC roles are **not** deleted.
 
+**GCP (entire project, or single `--region`):** GKE; MIGs and VMs; disks/snapshots/images; load balancing (forwarding rules, backends, URL maps, proxies, health checks); Cloud NAT/routers; addresses; firewalls/routes/VPN; subnets and networks (including default); Cloud SQL; Memorystore; Filestore; Artifact Registry; Cloud Run; Cloud Functions; GCS buckets. Service accounts, custom roles, IAM bindings, and workload identity pools are **not** deleted.
+
 ## Safety
 
 - Scheduled runs perform **real deletions**. The enabled-accounts config is the primary guardrail.
-- Use dedicated cleanup IAM/OCI/Azure SP users with delete permissions scoped to test accounts only.
+- Use dedicated cleanup IAM/OCI/Azure SP/GCP SA credentials with delete permissions scoped to test accounts only.
 - Workflow uses concurrency control to prevent overlapping purges.
 - Manual dispatch supports `dry_run` and single-account targeting.

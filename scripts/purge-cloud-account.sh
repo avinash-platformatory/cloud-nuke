@@ -3,7 +3,7 @@ set -euo pipefail
 
 # purge-cloud-account.sh
 #
-# Nuke all billable resources in a cloud account. Supports AWS, OCI, and Azure.
+# Nuke all billable resources in a cloud account. Supports AWS, OCI, Azure, and GCP.
 # Credentials are loaded from a JSON credentials file (see config/credentials.example.json).
 #
 # AWS deletes (per region, in parallel):
@@ -28,6 +28,14 @@ set -euo pipefail
 #   soft-deleted Key Vaults purged.
 #   Entra ID / role assignments / custom RBAC roles are NEVER deleted.
 #
+# GCP deletes (entire project, or single --region):
+#   GKE, MIGs, VMs, disks, snapshots, images, load balancing (forwarding
+#   rules, backends, URL maps, proxies, health checks), Cloud NAT/routers,
+#   addresses, firewalls, routes, VPN, subnets, networks, Cloud SQL,
+#   Memorystore, Filestore, Artifact Registry, Cloud Run, Cloud Functions,
+#   GCS buckets.
+#   IAM (service accounts, roles, bindings, WI pools) are NEVER deleted.
+#
 # Other IAM *customer-managed policies* are never deleted (AWS or OCI): not a direct
 # billing line item; safe to leave for human / IaC cleanup. Exception: policies
 # under /kafka-streamtime/ are deleted with their users (Fleet Manager S3 access).
@@ -37,6 +45,7 @@ set -euo pipefail
 #   ./scripts/purge-cloud-account.sh --account sub1 --credentials-file /path/to/creds.json
 #   ./scripts/purge-cloud-account.sh --account oci-lab --credentials-file creds.json --dry-run
 #   ./scripts/purge-cloud-account.sh --account azure-lab --credentials-file creds.json --yes
+#   ./scripts/purge-cloud-account.sh --account gcp-lab --credentials-file creds.json --yes
 #   ./scripts/purge-cloud-account.sh --account sub1 --credentials-file creds.json --region us-east-1 --yes
 #
 # Options:
@@ -107,7 +116,7 @@ if '$ACCOUNT_NAME' not in accounts:
 
 acct = accounts['$ACCOUNT_NAME']
 provider = acct.get('provider', '')
-if provider not in ('aws', 'oci', 'azure'):
+if provider not in ('aws', 'oci', 'azure', 'gcp'):
     print(f\"Error: unsupported provider '{provider}' for account '$ACCOUNT_NAME'\", file=sys.stderr)
     sys.exit(1)
 
@@ -1012,14 +1021,371 @@ run_azure() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GCP
+# ══════════════════════════════════════════════════════════════════════════════
+run_gcp() {
+  local GCP_KEY_FILE PROJECT_ID
+  GCP_KEY_FILE=$(mktemp /tmp/gcp_sa_XXXXXX.json)
+  trap "rm -f '$GCP_KEY_FILE'" EXIT
+
+  echo "$PROVIDER_JSON" | python3 -c "
+import json, sys, os
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except json.JSONDecodeError:
+    d = json.loads(raw, strict=False)
+key = d['configuration']['service_account_key']
+# service_account_key may already be a JSON object string or a dict-like string
+if isinstance(key, dict):
+    key_str = json.dumps(key)
+else:
+    # Re-serialize to ensure valid single-line/file JSON (handles escaped JSON strings)
+    try:
+        key_str = json.dumps(json.loads(key))
+    except json.JSONDecodeError:
+        key_str = key
+with open('$GCP_KEY_FILE', 'w') as f:
+    f.write(key_str)
+    if not key_str.endswith('\n'):
+        f.write('\n')
+os.chmod('$GCP_KEY_FILE', 0o600)
+"
+
+  PROJECT_ID=$(python3 -c "
+import json
+with open('$GCP_KEY_FILE') as f:
+    print(json.load(f).get('project_id', ''))
+")
+  [[ -z "$PROJECT_ID" ]] && { echo "Error: project_id missing from GCP service_account_key for '$ACCOUNT_NAME'." >&2; exit 1; }
+
+  echo "  Activating service account for project: $PROJECT_ID"
+  if ! gcloud auth activate-service-account --key-file="$GCP_KEY_FILE" --project="$PROJECT_ID" --quiet 2>/dev/null; then
+    echo "Error: GCP credentials for '$ACCOUNT_NAME' are invalid or expired." >&2
+    exit 1
+  fi
+  gcloud config set project "$PROJECT_ID" --quiet >/dev/null
+  if ! gcloud projects describe "$PROJECT_ID" --format=json &>/dev/null; then
+    echo "Error: cannot describe GCP project '$PROJECT_ID' for '$ACCOUNT_NAME'." >&2
+    exit 1
+  fi
+  echo "  Credentials validated."
+
+  local REGIONS=()
+  if [[ -n "$TARGET_REGION" ]]; then
+    REGIONS=("$TARGET_REGION")
+  else
+    while IFS= read -r r; do [[ -n "$r" ]] && REGIONS+=("$r"); done < <(
+      gcloud compute regions list --format='value(name)' 2>/dev/null || true
+    )
+  fi
+  [[ ${#REGIONS[@]} -eq 0 ]] && { echo "Error: no GCP regions found." >&2; exit 1; }
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Account:            $ACCOUNT_NAME  (gcp)"
+  echo "  Project:            $PROJECT_ID"
+  echo "  Regions:            ${REGIONS[*]}"
+  echo "  Dry run:            $DRY_RUN"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [[ "$DRY_RUN" == "false" && "$AUTO_YES" == "false" ]]; then
+    read -r -p "⚠  DELETE ALL billable resources in $ACCOUNT_NAME (GCP project $PROJECT_ID). Type 'yes': " C
+    [[ "$C" == "yes" ]] || { echo "Aborted."; exit 0; }
+  fi
+
+  # ── GKE clusters ───────────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  GCP GKE clusters"; echo "══════════════════════════════════════════════════"
+  # List: NAME LOCATION (region or zone)
+  while IFS=$'\t' read -r CNAME CLOC; do
+    [[ -z "${CNAME:-}" ]] && continue
+    if [[ -n "$TARGET_REGION" ]]; then
+      # Match region prefix (cluster location may be zone like us-central1-a)
+      [[ "$CLOC" != "$TARGET_REGION" && "$CLOC" != "$TARGET_REGION"-* ]] && continue
+    fi
+    echo "  [gcp] GKE: $CNAME ($CLOC)"
+    [[ "$DRY_RUN" == "false" ]] && gcloud container clusters delete "$CNAME" --location="$CLOC" --quiet --async 2>/dev/null || true
+  done < <(gcloud container clusters list --format='value(name,location)' 2>/dev/null || true)
+
+  if [[ "$DRY_RUN" == "false" ]]; then
+    local WAIT_I=0
+    while [[ $WAIT_I -lt 60 ]]; do
+      local REMAINING=0
+      while IFS=$'\t' read -r CNAME CLOC; do
+        [[ -z "${CNAME:-}" ]] && continue
+        if [[ -n "$TARGET_REGION" ]]; then
+          [[ "$CLOC" != "$TARGET_REGION" && "$CLOC" != "$TARGET_REGION"-* ]] && continue
+        fi
+        REMAINING=$((REMAINING + 1))
+      done < <(gcloud container clusters list --format='value(name,location)' 2>/dev/null || true)
+      [[ "$REMAINING" -eq 0 ]] && break
+      echo "  [gcp] waiting for GKE deletion ($REMAINING remaining)..."
+      sleep 30
+      WAIT_I=$((WAIT_I + 1))
+    done
+  fi
+
+  # ── Per-region compute / networking / data ────────────────────────────────
+  gcp_sweep_region() {
+    local REGION="$1"
+    echo "  [gcp/$REGION] sweeping..."
+
+    # Managed instance groups
+    for MIG in $(gcloud compute instance-groups managed list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] MIG: $MIG"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute instance-groups managed delete "$MIG" --region="$REGION" --quiet 2>/dev/null || true
+    done
+    # Zonal MIGs in this region's zones
+    for ZONE in $(gcloud compute zones list --filter="region:($REGION)" --format='value(name)' 2>/dev/null || true); do
+      for MIG in $(gcloud compute instance-groups managed list --zones="$ZONE" --format='value(name)' 2>/dev/null || true); do
+        echo "  [gcp/$ZONE] MIG: $MIG"
+        [[ "$DRY_RUN" == "false" ]] && gcloud compute instance-groups managed delete "$MIG" --zone="$ZONE" --quiet 2>/dev/null || true
+      done
+      for INST in $(gcloud compute instances list --zones="$ZONE" --format='value(name)' 2>/dev/null || true); do
+        echo "  [gcp/$ZONE] VM: $INST"
+        [[ "$DRY_RUN" == "false" ]] && gcloud compute instances delete "$INST" --zone="$ZONE" --quiet 2>/dev/null || true
+      done
+      for DISK in $(gcloud compute disks list --zones="$ZONE" --format='value(name)' 2>/dev/null || true); do
+        echo "  [gcp/$ZONE] disk: $DISK"
+        [[ "$DRY_RUN" == "false" ]] && gcloud compute disks delete "$DISK" --zone="$ZONE" --quiet 2>/dev/null || true
+      done
+    done
+
+    # Regional disks
+    for DISK in $(gcloud compute disks list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] regional disk: $DISK"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute disks delete "$DISK" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Addresses (regional)
+    for ADDR in $(gcloud compute addresses list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] address: $ADDR"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute addresses delete "$ADDR" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Forwarding rules (regional)
+    for FR in $(gcloud compute forwarding-rules list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] forwarding rule: $FR"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute forwarding-rules delete "$FR" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Backend services (regional)
+    for BS in $(gcloud compute backend-services list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] backend service: $BS"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute backend-services delete "$BS" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Target pools
+    for TP in $(gcloud compute target-pools list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] target pool: $TP"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute target-pools delete "$TP" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Cloud Routers + NAT
+    for ROUTER in $(gcloud compute routers list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      for NAT in $(gcloud compute routers nats list --router="$ROUTER" --region="$REGION" --format='value(name)' 2>/dev/null || true); do
+        echo "  [gcp/$REGION] Cloud NAT: $ROUTER/$NAT"
+        [[ "$DRY_RUN" == "false" ]] && gcloud compute routers nats delete "$NAT" --router="$ROUTER" --region="$REGION" --quiet 2>/dev/null || true
+      done
+      echo "  [gcp/$REGION] router: $ROUTER"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute routers delete "$ROUTER" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # VPN tunnels / gateways (regional)
+    for TUN in $(gcloud compute vpn-tunnels list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] VPN tunnel: $TUN"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute vpn-tunnels delete "$TUN" --region="$REGION" --quiet 2>/dev/null || true
+    done
+    for VGW in $(gcloud compute vpn-gateways list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] VPN gateway: $VGW"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute vpn-gateways delete "$VGW" --region="$REGION" --quiet 2>/dev/null || true
+    done
+    for TGW in $(gcloud compute target-vpn-gateways list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] target VPN gateway: $TGW"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute target-vpn-gateways delete "$TGW" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Subnets
+    for SUBNET in $(gcloud compute networks subnets list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] subnet: $SUBNET"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute networks subnets delete "$SUBNET" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Cloud SQL
+    for SQL in $(gcloud sql instances list --format='value(name,region)' 2>/dev/null | awk -v r="$REGION" '$2==r {print $1}'); do
+      echo "  [gcp/$REGION] Cloud SQL: $SQL"
+      [[ "$DRY_RUN" == "false" ]] && gcloud sql instances delete "$SQL" --quiet 2>/dev/null || true
+    done
+
+    # Memorystore Redis
+    for REDIS in $(gcloud redis instances list --region="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] Memorystore Redis: $REDIS"
+      [[ "$DRY_RUN" == "false" ]] && gcloud redis instances delete "$REDIS" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Memorystore Memcached
+    for MC in $(gcloud memcache instances list --region="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] Memorystore Memcached: $MC"
+      [[ "$DRY_RUN" == "false" ]] && gcloud memcache instances delete "$MC" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Filestore
+    while IFS=$'\t' read -r FS_NAME FS_LOC; do
+      [[ -z "${FS_NAME:-}" ]] && continue
+      [[ "$FS_LOC" != "$REGION" && "$FS_LOC" != "$REGION"-* ]] && continue
+      echo "  [gcp/$FS_LOC] Filestore: $FS_NAME"
+      [[ "$DRY_RUN" == "false" ]] && gcloud filestore instances delete "$FS_NAME" --location="$FS_LOC" --quiet 2>/dev/null || true
+    done < <(gcloud filestore instances list --format='value(name,location)' 2>/dev/null || true)
+
+    # Artifact Registry (regional)
+    for REPO in $(gcloud artifacts repositories list --location="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] Artifact Registry: $REPO"
+      [[ "$DRY_RUN" == "false" ]] && gcloud artifacts repositories delete "$REPO" --location="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Cloud Run services / jobs
+    for SVC in $(gcloud run services list --region="$REGION" --format='value(metadata.name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] Cloud Run service: $SVC"
+      [[ "$DRY_RUN" == "false" ]] && gcloud run services delete "$SVC" --region="$REGION" --quiet 2>/dev/null || true
+    done
+    for JOB in $(gcloud run jobs list --region="$REGION" --format='value(metadata.name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] Cloud Run job: $JOB"
+      [[ "$DRY_RUN" == "false" ]] && gcloud run jobs delete "$JOB" --region="$REGION" --quiet 2>/dev/null || true
+    done
+
+    # Cloud Functions (gen2 often regional)
+    for FN in $(gcloud functions list --regions="$REGION" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$REGION] Cloud Function: $FN"
+      [[ "$DRY_RUN" == "false" ]] && gcloud functions delete "$FN" --region="$REGION" --quiet 2>/dev/null || true
+    done
+  }
+
+  local PIDS=()
+  for REGION in "${REGIONS[@]}"; do
+    gcp_sweep_region "$REGION" &
+    PIDS+=($!)
+  done
+  wait "${PIDS[@]}" 2>/dev/null || true
+
+  # ── Global resources ───────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  GCP global resources"; echo "══════════════════════════════════════════════════"
+
+  # Snapshots (global)
+  for SNAP in $(gcloud compute snapshots list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] snapshot: $SNAP"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute snapshots delete "$SNAP" --quiet 2>/dev/null || true
+  done
+
+  # Custom images (skip public/family system images owned by others — only project images)
+  for IMG in $(gcloud compute images list --no-standard-images --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] image: $IMG"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute images delete "$IMG" --quiet 2>/dev/null || true
+  done
+
+  # Global forwarding rules / LB stack
+  for FR in $(gcloud compute forwarding-rules list --global --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] forwarding rule: $FR"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute forwarding-rules delete "$FR" --global --quiet 2>/dev/null || true
+  done
+  for TP in $(gcloud compute target-http-proxies list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] HTTP proxy: $TP"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute target-http-proxies delete "$TP" --quiet 2>/dev/null || true
+  done
+  for TP in $(gcloud compute target-https-proxies list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] HTTPS proxy: $TP"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute target-https-proxies delete "$TP" --quiet 2>/dev/null || true
+  done
+  for TP in $(gcloud compute target-ssl-proxies list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] SSL proxy: $TP"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute target-ssl-proxies delete "$TP" --quiet 2>/dev/null || true
+  done
+  for TP in $(gcloud compute target-tcp-proxies list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] TCP proxy: $TP"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute target-tcp-proxies delete "$TP" --quiet 2>/dev/null || true
+  done
+  for UM in $(gcloud compute url-maps list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] URL map: $UM"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute url-maps delete "$UM" --quiet 2>/dev/null || true
+  done
+  for BS in $(gcloud compute backend-services list --global --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] backend service: $BS"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute backend-services delete "$BS" --global --quiet 2>/dev/null || true
+  done
+  for HC in $(gcloud compute health-checks list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] health check: $HC"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute health-checks delete "$HC" --quiet 2>/dev/null || true
+  done
+  for HC in $(gcloud compute http-health-checks list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] HTTP health check: $HC"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute http-health-checks delete "$HC" --quiet 2>/dev/null || true
+  done
+  for HC in $(gcloud compute https-health-checks list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] HTTPS health check: $HC"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute https-health-checks delete "$HC" --quiet 2>/dev/null || true
+  done
+
+  # Global addresses
+  for ADDR in $(gcloud compute addresses list --global --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] address: $ADDR"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute addresses delete "$ADDR" --global --quiet 2>/dev/null || true
+  done
+
+  # Firewall rules
+  for FW in $(gcloud compute firewall-rules list --format='value(name)' 2>/dev/null || true); do
+    echo "  [gcp/global] firewall: $FW"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute firewall-rules delete "$FW" --quiet 2>/dev/null || true
+  done
+
+  # Routes (skip local/default gateway routes that cannot be deleted)
+  for ROUTE in $(gcloud compute routes list --format='value(name)' 2>/dev/null || true); do
+    [[ "$ROUTE" == default-route-* ]] && continue
+    echo "  [gcp/global] route: $ROUTE"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute routes delete "$ROUTE" --quiet 2>/dev/null || true
+  done
+
+  # Network peerings then networks (including default for max cleanup)
+  for NET in $(gcloud compute networks list --format='value(name)' 2>/dev/null || true); do
+    for PEER in $(gcloud compute networks describe "$NET" --format='value(peerings[].name)' 2>/dev/null || true); do
+      echo "  [gcp/global] peering: $NET/$PEER"
+      [[ "$DRY_RUN" == "false" ]] && gcloud compute networks peerings delete "$PEER" --network="$NET" --quiet 2>/dev/null || true
+    done
+    echo "  [gcp/global] network: $NET"
+    [[ "$DRY_RUN" == "false" ]] && gcloud compute networks delete "$NET" --quiet 2>/dev/null || true
+  done
+
+  # Artifact Registry multi-region / global locations commonly used
+  for LOC in us eu asia; do
+    for REPO in $(gcloud artifacts repositories list --location="$LOC" --format='value(name)' 2>/dev/null || true); do
+      echo "  [gcp/$LOC] Artifact Registry: $REPO"
+      [[ "$DRY_RUN" == "false" ]] && gcloud artifacts repositories delete "$REPO" --location="$LOC" --quiet 2>/dev/null || true
+    done
+  done
+
+  # GCS buckets (global)
+  for BUCKET in $(gcloud storage buckets list --format='value(name)' 2>/dev/null || gsutil ls 2>/dev/null | sed 's|gs://||;s|/$||' || true); do
+    [[ -z "$BUCKET" ]] && continue
+    echo "  [gcp/global] GCS bucket: $BUCKET"
+    if [[ "$DRY_RUN" == "false" ]]; then
+      gcloud storage rm -r "gs://$BUCKET" 2>/dev/null || gsutil -m rm -r "gs://$BUCKET" 2>/dev/null || true
+      gcloud storage buckets delete "gs://$BUCKET" --quiet 2>/dev/null || gsutil rb "gs://$BUCKET" 2>/dev/null || true
+    fi
+  done
+
+  # Service accounts, custom roles, IAM bindings, and workload identity pools
+  # are intentionally NOT deleted.
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Dispatch
 # ══════════════════════════════════════════════════════════════════════════════
 case "$PROVIDER_TYPE" in
   aws)   require_cmd aws; run_aws ;;
   oci)   require_cmd oci; run_oci ;;
   azure) require_cmd az;  run_azure ;;
+  gcp)   require_cmd gcloud; run_gcp ;;
   *)
-    echo "Error: unsupported provider type '$PROVIDER_TYPE'. Only 'aws', 'oci', and 'azure' are supported." >&2
+    echo "Error: unsupported provider type '$PROVIDER_TYPE'. Only 'aws', 'oci', 'azure', and 'gcp' are supported." >&2
     exit 1 ;;
 esac
 
