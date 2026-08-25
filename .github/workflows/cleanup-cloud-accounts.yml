@@ -120,6 +120,15 @@ jobs:
       - name: Install OCI CLI
         run: pip install oci-cli
 
+      - name: Install doctl
+        env:
+          DOCTL_VERSION: '1.123.0'
+        run: |
+          set -euo pipefail
+          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin doctl
+          doctl version
+
       - name: Purge account
         env:
           INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}

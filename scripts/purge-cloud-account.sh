@@ -3,8 +3,9 @@ set -euo pipefail
 
 # purge-cloud-account.sh
 #
-# Nuke all billable resources in a cloud account. Supports AWS, OCI, Azure, and GCP.
-# Credentials are loaded from a JSON credentials file (see config/credentials.example.json).
+# Nuke all billable resources in a cloud account. Supports AWS, OCI, Azure, GCP,
+# and DigitalOcean. Credentials are loaded from a JSON credentials file
+# (see config/credentials.example.json).
 #
 # AWS deletes (per region, in parallel):
 #   EKS node groups + clusters, EC2, ASGs, ALB/NLB/CLB, NAT gateways,
@@ -36,6 +37,13 @@ set -euo pipefail
 #   GCS buckets.
 #   IAM (service accounts, roles, bindings, WI pools) are NEVER deleted.
 #
+# DigitalOcean deletes (entire account, or single --region):
+#   DOKS, Droplets, Volumes, snapshots, custom images, Load Balancers,
+#   Firewalls, Reserved IPs, VPCs, Managed Databases, Apps Platform,
+#   Container Registry repos, Spaces buckets (via Spaces keys + S3 API),
+#   Spaces access keys (except spaces_access_key from credentials).
+#   Team members, account API tokens, and SSH keys are NEVER deleted.
+#
 # Other IAM *customer-managed policies* are never deleted (AWS or OCI): not a direct
 # billing line item; safe to leave for human / IaC cleanup. Exception: policies
 # under /kafka-streamtime/ are deleted with their users (Fleet Manager S3 access).
@@ -46,6 +54,7 @@ set -euo pipefail
 #   ./scripts/purge-cloud-account.sh --account oci-lab --credentials-file creds.json --dry-run
 #   ./scripts/purge-cloud-account.sh --account azure-lab --credentials-file creds.json --yes
 #   ./scripts/purge-cloud-account.sh --account gcp-lab --credentials-file creds.json --yes
+#   ./scripts/purge-cloud-account.sh --account do-lab --credentials-file creds.json --yes
 #   ./scripts/purge-cloud-account.sh --account sub1 --credentials-file creds.json --region us-east-1 --yes
 #
 # Options:
@@ -116,7 +125,7 @@ if '$ACCOUNT_NAME' not in accounts:
 
 acct = accounts['$ACCOUNT_NAME']
 provider = acct.get('provider', '')
-if provider not in ('aws', 'oci', 'azure', 'gcp'):
+if provider not in ('aws', 'oci', 'azure', 'gcp', 'digitalocean'):
     print(f\"Error: unsupported provider '{provider}' for account '$ACCOUNT_NAME'\", file=sys.stderr)
     sys.exit(1)
 
@@ -1377,15 +1386,371 @@ with open('$GCP_KEY_FILE') as f:
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DigitalOcean
+# ══════════════════════════════════════════════════════════════════════════════
+run_digitalocean() {
+  local DO_TOKEN SPACES_ACCESS_KEY SPACES_SECRET_KEY
+  DO_TOKEN=$(echo "$PROVIDER_JSON" | py "import json,sys; print(json.load(sys.stdin)['configuration'].get('token') or '')")
+  SPACES_ACCESS_KEY=$(echo "$PROVIDER_JSON" | py "import json,sys; print(json.load(sys.stdin)['configuration'].get('spaces_access_key') or '')")
+  SPACES_SECRET_KEY=$(echo "$PROVIDER_JSON" | py "import json,sys; print(json.load(sys.stdin)['configuration'].get('spaces_secret_key') or '')")
+
+  [[ -z "$DO_TOKEN" ]] && { echo "Error: DigitalOcean token missing for '$ACCOUNT_NAME'." >&2; exit 1; }
+
+  export DIGITALOCEAN_ACCESS_TOKEN="$DO_TOKEN"
+  if ! doctl account get --output json &>/dev/null; then
+    echo "Error: DigitalOcean credentials for '$ACCOUNT_NAME' are invalid or expired." >&2
+    exit 1
+  fi
+  echo "  Credentials validated."
+
+  local REGION_FILTER="${TARGET_REGION:-}"
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Account:            $ACCOUNT_NAME  (digitalocean)"
+  echo "  Region filter:      ${REGION_FILTER:-all}"
+  echo "  Dry run:            $DRY_RUN"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [[ "$DRY_RUN" == "false" && "$AUTO_YES" == "false" ]]; then
+    read -r -p "⚠  DELETE ALL billable resources in $ACCOUNT_NAME (DigitalOcean). Type 'yes': " C
+    [[ "$C" == "yes" ]] || { echo "Aborted."; exit 0; }
+  fi
+
+  do_region_match() {
+    local R="${1:-}"
+    [[ -z "$REGION_FILTER" ]] && return 0
+    [[ "$R" == "$REGION_FILTER" ]] && return 0
+    return 1
+  }
+
+  # Emit tab-separated id, name, region from doctl JSON list (fields vary by resource)
+  do_json_rows() {
+    local CMD="$1" ID_KEY="$2" NAME_KEY="$3" REGION_KEY="$4"
+    # shellcheck disable=SC2086
+    eval "$CMD --output json" 2>/dev/null | py "
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw: sys.exit(0)
+try: data=json.loads(raw)
+except: sys.exit(0)
+if isinstance(data, dict):
+    # some commands wrap in a key
+    for v in data.values():
+        if isinstance(v, list):
+            data=v
+            break
+if not isinstance(data, list):
+    sys.exit(0)
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    rid=item.get('$ID_KEY','')
+    name=item.get('$NAME_KEY','')
+    if isinstance(name, dict):
+        name=name.get('name','') or name.get('Name','')
+    region=item.get('$REGION_KEY','') or ''
+    if isinstance(region, dict):
+        region=region.get('slug','') or region.get('name','')
+    print(f'{rid}\t{name}\t{region}')
+" 2>/dev/null || true
+  }
+
+  # ── DOKS first ─────────────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean Kubernetes (DOKS)"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r CID CNAME CREGION; do
+    [[ -z "${CID:-}" ]] && continue
+    do_region_match "$CREGION" || continue
+    echo "  [do] DOKS: $CNAME ($CID) [$CREGION]"
+    [[ "$DRY_RUN" == "false" ]] && doctl kubernetes cluster delete "$CID" --force --dangerous 2>/dev/null || true
+  done < <(do_json_rows "doctl kubernetes cluster list" id name region)
+
+  if [[ "$DRY_RUN" == "false" ]]; then
+    local WAIT_I=0
+    while [[ $WAIT_I -lt 60 ]]; do
+      local REMAINING=0
+      while IFS=$'\t' read -r CID CNAME CREGION; do
+        [[ -z "${CID:-}" ]] && continue
+        do_region_match "$CREGION" || continue
+        REMAINING=$((REMAINING + 1))
+      done < <(do_json_rows "doctl kubernetes cluster list" id name region)
+      [[ "$REMAINING" -eq 0 ]] && break
+      echo "  [do] waiting for DOKS deletion ($REMAINING remaining)..."
+      sleep 30
+      WAIT_I=$((WAIT_I + 1))
+    done
+  fi
+
+  # ── Load balancers ─────────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean load balancers"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r ID NAME REGION; do
+    [[ -z "${ID:-}" ]] && continue
+    do_region_match "$REGION" || continue
+    echo "  [do] load balancer: $NAME ($ID)"
+    [[ "$DRY_RUN" == "false" ]] && doctl compute load-balancer delete "$ID" --force 2>/dev/null || true
+  done < <(do_json_rows "doctl compute load-balancer list" id name region)
+
+  # ── Droplets ───────────────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean Droplets"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r ID NAME REGION; do
+    [[ -z "${ID:-}" ]] && continue
+    do_region_match "$REGION" || continue
+    echo "  [do] Droplet: $NAME ($ID)"
+    [[ "$DRY_RUN" == "false" ]] && doctl compute droplet delete "$ID" --force 2>/dev/null || true
+  done < <(do_json_rows "doctl compute droplet list" id name region)
+
+  # ── Volumes ────────────────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean volumes"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r ID NAME REGION; do
+    [[ -z "${ID:-}" ]] && continue
+    do_region_match "$REGION" || continue
+    echo "  [do] volume: $NAME ($ID)"
+    if [[ "$DRY_RUN" == "false" ]]; then
+      doctl compute volume get "$ID" --output json 2>/dev/null | py "
+import json,sys
+try: d=json.loads(sys.stdin.read())
+except: sys.exit(0)
+if isinstance(d, list): d=d[0] if d else {}
+for did in (d.get('droplet_ids') or []):
+    print(did)
+" 2>/dev/null | while read -r DID; do
+        [[ -n "$DID" ]] && doctl compute volume-action detach "$ID" "$DID" --wait 2>/dev/null || true
+      done
+      doctl compute volume delete "$ID" --force 2>/dev/null || true
+    fi
+  done < <(do_json_rows "doctl compute volume list" id name region)
+
+  # ── Snapshots (Droplet + volume) ───────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean snapshots"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r ID NAME REGION; do
+    [[ -z "${ID:-}" ]] && continue
+    do_region_match "$REGION" || continue
+    echo "  [do] snapshot: $NAME ($ID)"
+    [[ "$DRY_RUN" == "false" ]] && doctl compute snapshot delete "$ID" --force 2>/dev/null || true
+  done < <(do_json_rows "doctl compute snapshot list" id name resource_region)
+
+  # ── Custom images ──────────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean images"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r ID NAME TYPE; do
+    [[ -z "${ID:-}" ]] && continue
+    [[ "$TYPE" != "custom" && "$TYPE" != "user" ]] && continue
+    echo "  [do] image: $NAME ($ID)"
+    [[ "$DRY_RUN" == "false" ]] && doctl compute image delete "$ID" --force 2>/dev/null || true
+  done < <(doctl compute image list --output json 2>/dev/null | py "
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw: sys.exit(0)
+try: data=json.loads(raw)
+except: sys.exit(0)
+if not isinstance(data, list): sys.exit(0)
+for item in data:
+    print(f\"{item.get('id','')}\t{item.get('name','')}\t{item.get('type','')}\")
+" 2>/dev/null || true)
+
+  # ── Firewalls ──────────────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean firewalls"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r ID NAME REGION; do
+    [[ -z "${ID:-}" ]] && continue
+    echo "  [do] firewall: $NAME ($ID)"
+    [[ "$DRY_RUN" == "false" ]] && doctl compute firewall delete "$ID" --force 2>/dev/null || true
+  done < <(do_json_rows "doctl compute firewall list" id name name)
+
+  # ── Reserved IPs ───────────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean reserved IPs"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r IP REGION DROPLET; do
+    [[ -z "${IP:-}" ]] && continue
+    do_region_match "$REGION" || continue
+    echo "  [do] reserved IP: $IP"
+    if [[ "$DRY_RUN" == "false" ]]; then
+      [[ -n "$DROPLET" && "$DROPLET" != "-" && "$DROPLET" != "0" && "$DROPLET" != "None" ]] && \
+        doctl compute reserved-ip unassign "$IP" 2>/dev/null || true
+      doctl compute reserved-ip delete "$IP" --force 2>/dev/null || true
+    fi
+  done < <(doctl compute reserved-ip list --output json 2>/dev/null | py "
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw: sys.exit(0)
+try: data=json.loads(raw)
+except: sys.exit(0)
+if not isinstance(data, list): sys.exit(0)
+for item in data:
+    region=item.get('region') or {}
+    rslug=region.get('slug','') if isinstance(region,dict) else (region or '')
+    droplet=item.get('droplet_id') or item.get('droplet') or ''
+    if isinstance(droplet, dict):
+        droplet=droplet.get('id','')
+    print(f\"{item.get('ip','')}\t{rslug}\t{droplet}\")
+" 2>/dev/null || true)
+
+  # ── Managed databases ──────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean managed databases"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r ID NAME REGION; do
+    [[ -z "${ID:-}" ]] && continue
+    do_region_match "$REGION" || continue
+    echo "  [do] database: $NAME ($ID)"
+    [[ "$DRY_RUN" == "false" ]] && doctl databases delete "$ID" --force 2>/dev/null || true
+  done < <(do_json_rows "doctl databases list" id name region)
+
+  # ── Apps Platform ──────────────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean Apps Platform"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r ID NAME REGION; do
+    [[ -z "${ID:-}" ]] && continue
+    if [[ -n "$REGION_FILTER" && -n "$REGION" ]]; then
+      do_region_match "$REGION" || continue
+    fi
+    echo "  [do] app: $NAME ($ID)"
+    [[ "$DRY_RUN" == "false" ]] && doctl apps delete "$ID" --force 2>/dev/null || true
+  done < <(doctl apps list --output json 2>/dev/null | py "
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw: sys.exit(0)
+try: data=json.loads(raw)
+except: sys.exit(0)
+if not isinstance(data, list): sys.exit(0)
+for item in data:
+    spec=item.get('spec') or {}
+    name=spec.get('name','') if isinstance(spec,dict) else ''
+    region=spec.get('region','') if isinstance(spec,dict) else ''
+    print(f\"{item.get('id','')}\t{name}\t{region}\")
+" 2>/dev/null || true)
+
+  # ── Container Registry repositories ────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean Container Registry"; echo "══════════════════════════════════════════════════"
+  local REG_NAME
+  REG_NAME=$(doctl registry get --format Name --no-header 2>/dev/null || true)
+  if [[ -n "$REG_NAME" ]]; then
+    while IFS= read -r REPO; do
+      [[ -z "$REPO" ]] && continue
+      echo "  [do] registry repo: $REPO"
+      [[ "$DRY_RUN" == "false" ]] && doctl registry repository delete-v2 "$REPO" --force 2>/dev/null || \
+        doctl registry repository delete "$REPO" --force 2>/dev/null || true
+    done < <(doctl registry repository list-v2 --output json 2>/dev/null | py "
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw: sys.exit(0)
+try: data=json.loads(raw)
+except: sys.exit(0)
+if isinstance(data, dict): data=data.get('repositories',data.get('repository',[]))
+if not isinstance(data, list): sys.exit(0)
+for item in data:
+    print(item.get('name') or item.get('repository') or '')
+" 2>/dev/null || doctl registry repository list --format Name --no-header 2>/dev/null || true)
+  fi
+
+  # ── VPCs (after dependents) ────────────────────────────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean VPCs"; echo "══════════════════════════════════════════════════"
+  while IFS=$'\t' read -r ID NAME REGION; do
+    [[ -z "${ID:-}" ]] && continue
+    do_region_match "$REGION" || continue
+    echo "  [do] VPC: $NAME ($ID)"
+    [[ "$DRY_RUN" == "false" ]] && doctl vpcs delete "$ID" --force 2>/dev/null || true
+  done < <(do_json_rows "doctl vpcs list" id name region)
+
+  # ── Spaces buckets (requires Spaces keys + AWS CLI) ────────────────────────
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean Spaces"; echo "══════════════════════════════════════════════════"
+  if [[ -z "$SPACES_ACCESS_KEY" || -z "$SPACES_SECRET_KEY" ]]; then
+    echo "  [do] warning: spaces_access_key/spaces_secret_key not set; skipping Spaces bucket deletion"
+  else
+    require_cmd aws
+    # Common Spaces regions
+    local SPACES_REGIONS=()
+    if [[ -n "$REGION_FILTER" ]]; then
+      SPACES_REGIONS=("$REGION_FILTER")
+    else
+      SPACES_REGIONS=(nyc3 sfo2 sfo3 ams3 sgp1 fra1 blr1 syd1)
+    fi
+
+    export AWS_ACCESS_KEY_ID="$SPACES_ACCESS_KEY"
+    export AWS_SECRET_ACCESS_KEY="$SPACES_SECRET_KEY"
+    unset AWS_SESSION_TOKEN || true
+
+    for SREGION in "${SPACES_REGIONS[@]}"; do
+      local ENDPOINT="https://${SREGION}.digitaloceanspaces.com"
+      local BUCKETS
+      BUCKETS=$(aws --endpoint-url "$ENDPOINT" s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null || true)
+      for BUCKET in $BUCKETS; do
+        [[ -z "$BUCKET" ]] && continue
+        echo "  [do/$SREGION] Spaces bucket: $BUCKET"
+        if [[ "$DRY_RUN" == "false" ]]; then
+          aws --endpoint-url "$ENDPOINT" s3 rm "s3://$BUCKET" --recursive 2>/dev/null || true
+          # Versioned objects
+          local VERS
+          VERS=$(aws --endpoint-url "$ENDPOINT" s3api list-object-versions --bucket "$BUCKET" 2>/dev/null \
+            | py "import json,sys
+data=json.load(sys.stdin)
+objs=[{'Key':x['Key'],'VersionId':x['VersionId']} for x in data.get('Versions',[])+data.get('DeleteMarkers',[])]
+import json as j; print(j.dumps({'Objects':objs,'Quiet':True})) if objs else exit(1)" || true)
+          [[ -n "$VERS" ]] && aws --endpoint-url "$ENDPOINT" s3api delete-objects --bucket "$BUCKET" --delete "$VERS" >/dev/null 2>&1 || true
+          aws --endpoint-url "$ENDPOINT" s3api delete-bucket --bucket "$BUCKET" 2>/dev/null || true
+        fi
+      done
+    done
+
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+  fi
+
+  # ── Spaces access keys (via API; best-effort with doctl / curl) ─────────────
+  # Preserve spaces_access_key from credentials (used for bucket cleanup).
+  echo ""; echo "══════════════════════════════════════════════════"
+  echo "  DigitalOcean Spaces access keys"; echo "══════════════════════════════════════════════════"
+  # Prefer doctl if available; fall back to API v2
+  local KEYS_JSON
+  KEYS_JSON=$(doctl spaces keys list --output json 2>/dev/null || \
+    curl -skf -H "Authorization: Bearer $DO_TOKEN" \
+      "https://api.digitalocean.com/v2/spaces/keys?per_page=200" 2>/dev/null || true)
+  if [[ -n "$KEYS_JSON" ]]; then
+    while IFS= read -r KEY_ID; do
+      [[ -z "$KEY_ID" ]] && continue
+      if [[ -n "$SPACES_ACCESS_KEY" && "$KEY_ID" == "$SPACES_ACCESS_KEY" ]]; then
+        echo "  [do] skipping credential Spaces key: $KEY_ID"
+        continue
+      fi
+      echo "  [do] Spaces access key: $KEY_ID"
+      if [[ "$DRY_RUN" == "false" ]]; then
+        doctl spaces keys delete "$KEY_ID" --force 2>/dev/null || \
+          curl -skf -X DELETE -H "Authorization: Bearer $DO_TOKEN" \
+            "https://api.digitalocean.com/v2/spaces/keys/$KEY_ID" >/dev/null 2>&1 || true
+      fi
+    done < <(echo "$KEYS_JSON" | py "
+import json,sys
+raw=sys.stdin.read()
+try: d=json.loads(raw)
+except: sys.exit(0)
+# doctl may return a list; API returns {spaces_keys:[...]}
+items=d if isinstance(d,list) else d.get('spaces_keys',d.get('keys',[]))
+for k in items:
+    print(k.get('access_key','') or k.get('id','') or k.get('name',''))
+" 2>/dev/null || true)
+  else
+    echo "  [do] no Spaces keys listed (or API unavailable)"
+  fi
+
+  # Team members, account API tokens, and SSH keys are intentionally NOT deleted.
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Dispatch
 # ══════════════════════════════════════════════════════════════════════════════
 case "$PROVIDER_TYPE" in
-  aws)   require_cmd aws; run_aws ;;
-  oci)   require_cmd oci; run_oci ;;
-  azure) require_cmd az;  run_azure ;;
-  gcp)   require_cmd gcloud; run_gcp ;;
+  aws)           require_cmd aws;   run_aws ;;
+  oci)           require_cmd oci;   run_oci ;;
+  azure)         require_cmd az;    run_azure ;;
+  gcp)           require_cmd gcloud; run_gcp ;;
+  digitalocean)  require_cmd doctl; run_digitalocean ;;
   *)
-    echo "Error: unsupported provider type '$PROVIDER_TYPE'. Only 'aws', 'oci', 'azure', and 'gcp' are supported." >&2
+    echo "Error: unsupported provider type '$PROVIDER_TYPE'. Only 'aws', 'oci', 'azure', 'gcp', and 'digitalocean' are supported." >&2
     exit 1 ;;
 esac
 
