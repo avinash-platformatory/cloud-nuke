@@ -129,6 +129,15 @@ jobs:
             | sudo tar -xz -C /usr/local/bin doctl
           doctl version
 
+      - name: Install Civo CLI
+        env:
+          CIVO_VERSION: '1.5.4'
+        run: |
+          set -euo pipefail
+          curl -sL "https://github.com/civo/cli/releases/download/v${CIVO_VERSION}/civo-${CIVO_VERSION}-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin civo
+          civo version
+
       - name: Purge account
         env:
           INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}

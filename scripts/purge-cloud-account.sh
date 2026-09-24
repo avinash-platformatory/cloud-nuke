@@ -4,7 +4,7 @@ set -euo pipefail
 # purge-cloud-account.sh
 #
 # Nuke all billable resources in a cloud account. Supports AWS, OCI, Azure, GCP,
-# and DigitalOcean. Credentials are loaded from a JSON credentials file
+# DigitalOcean, and Civo. Credentials are loaded from a JSON credentials file
 # (see config/credentials.example.json).
 #
 # AWS deletes (per region, in parallel):
@@ -44,6 +44,12 @@ set -euo pipefail
 #   Spaces access keys (except spaces_access_key from credentials).
 #   Team members, account API tokens, and SSH keys are NEVER deleted.
 #
+# Civo deletes (entire account, or single --region):
+#   Kubernetes clusters, instances, volumes, instance snapshots, load
+#   balancers, firewalls, networks, databases, object stores, object-store
+#   credentials.
+#   SSH keys, teams/permissions, and account API keys are NEVER deleted.
+#
 # Other IAM *customer-managed policies* are never deleted (AWS or OCI): not a direct
 # billing line item; safe to leave for human / IaC cleanup. Exception: policies
 # under /kafka-streamtime/ are deleted with their users (Fleet Manager S3 access).
@@ -55,6 +61,7 @@ set -euo pipefail
 #   ./scripts/purge-cloud-account.sh --account azure-lab --credentials-file creds.json --yes
 #   ./scripts/purge-cloud-account.sh --account gcp-lab --credentials-file creds.json --yes
 #   ./scripts/purge-cloud-account.sh --account do-lab --credentials-file creds.json --yes
+#   ./scripts/purge-cloud-account.sh --account civo-lab --credentials-file creds.json --yes
 #   ./scripts/purge-cloud-account.sh --account sub1 --credentials-file creds.json --region us-east-1 --yes
 #
 # Options:
@@ -125,7 +132,7 @@ if '$ACCOUNT_NAME' not in accounts:
 
 acct = accounts['$ACCOUNT_NAME']
 provider = acct.get('provider', '')
-if provider not in ('aws', 'oci', 'azure', 'gcp', 'digitalocean'):
+if provider not in ('aws', 'oci', 'azure', 'gcp', 'digitalocean', 'civo'):
     print(f\"Error: unsupported provider '{provider}' for account '$ACCOUNT_NAME'\", file=sys.stderr)
     sys.exit(1)
 
@@ -1741,6 +1748,203 @@ for k in items:
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Civo
+# ══════════════════════════════════════════════════════════════════════════════
+run_civo() {
+  local CIVO_API_TOKEN
+  CIVO_API_TOKEN=$(echo "$PROVIDER_JSON" | py "import json,sys; print(json.load(sys.stdin)['configuration'].get('civo_api_token') or '')")
+  [[ -z "$CIVO_API_TOKEN" ]] && { echo "Error: civo_api_token missing for '$ACCOUNT_NAME'." >&2; exit 1; }
+
+  export CIVO_TOKEN="$CIVO_API_TOKEN"
+  if ! civo quota show --output json &>/dev/null && ! civo region ls --output json &>/dev/null; then
+    echo "Error: Civo credentials for '$ACCOUNT_NAME' are invalid or expired." >&2
+    exit 1
+  fi
+  echo "  Credentials validated."
+
+  local REGIONS=()
+  if [[ -n "$TARGET_REGION" ]]; then
+    REGIONS=("$TARGET_REGION")
+  else
+    while IFS= read -r r; do [[ -n "$r" ]] && REGIONS+=("$r"); done < <(
+      civo region ls --output json 2>/dev/null | py "
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw: sys.exit(0)
+try: data=json.loads(raw)
+except: sys.exit(0)
+if not isinstance(data, list): sys.exit(0)
+for item in data:
+    code=item.get('code') or item.get('name') or item.get('region') or ''
+    if code: print(code)
+" 2>/dev/null || true
+    )
+  fi
+  [[ ${#REGIONS[@]} -eq 0 ]] && { echo "Error: no Civo regions found." >&2; exit 1; }
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Account:            $ACCOUNT_NAME  (civo)"
+  echo "  Regions:            ${REGIONS[*]}"
+  echo "  Dry run:            $DRY_RUN"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [[ "$DRY_RUN" == "false" && "$AUTO_YES" == "false" ]]; then
+    read -r -p "⚠  DELETE ALL billable resources in $ACCOUNT_NAME (Civo). Type 'yes': " C
+    [[ "$C" == "yes" ]] || { echo "Aborted."; exit 0; }
+  fi
+
+  # Print tab-separated id and name from a civo JSON list command
+  civo_list_rows() {
+    local CMD="$1" ID_KEY="$2" NAME_KEY="$3"
+    # shellcheck disable=SC2086
+    eval "$CMD --output json" 2>/dev/null | py "
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw: sys.exit(0)
+try: data=json.loads(raw)
+except: sys.exit(0)
+if isinstance(data, dict):
+    for v in data.values():
+        if isinstance(v, list):
+            data=v
+            break
+if not isinstance(data, list):
+    sys.exit(0)
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    rid=item.get('$ID_KEY') or item.get('id') or item.get('ID') or ''
+    name=(item.get('$NAME_KEY') or item.get('name') or item.get('Name')
+          or item.get('hostname') or item.get('Hostname') or '')
+    if rid or name:
+        print(f'{rid}\t{name}')
+" 2>/dev/null || true
+  }
+
+  civo_sweep_region() {
+    local REGION="$1"
+    echo ""
+    echo "══════════════════════════════════════════════════"
+    echo "  Civo region: $REGION"
+    echo "══════════════════════════════════════════════════"
+    civo region current "$REGION" >/dev/null 2>&1 || true
+
+    # Kubernetes clusters first
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] k8s: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && civo kubernetes delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo kubernetes ls --region=$REGION" id name)
+
+    if [[ "$DRY_RUN" == "false" ]]; then
+      local WAIT_I=0
+      while [[ $WAIT_I -lt 40 ]]; do
+        local REMAINING
+        REMAINING=$(civo_list_rows "civo kubernetes ls --region=$REGION" id name | grep -c . || true)
+        [[ "${REMAINING:-0}" -eq 0 ]] && break
+        echo "  [civo/$REGION] waiting for k8s deletion ($REMAINING remaining)..."
+        sleep 15
+        WAIT_I=$((WAIT_I + 1))
+      done
+    fi
+
+    # Load balancers
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] load balancer: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && civo loadbalancer delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo loadbalancer ls --region=$REGION" id name)
+
+    # Instances (+ snapshots)
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] instance: $TARGET"
+      while IFS=$'\t' read -r SID SNAME; do
+        [[ -z "${SID:-}" && -z "${SNAME:-}" ]] && continue
+        local STARGET="${SNAME:-$SID}"
+        echo "  [civo/$REGION] instance snapshot: $TARGET/$STARGET"
+        [[ "$DRY_RUN" == "false" ]] && civo instance snapshot remove "$TARGET" "$STARGET" --region="$REGION" -y 2>/dev/null || true
+      done < <(civo_list_rows "civo instance snapshot ls $TARGET --region=$REGION" id name)
+      [[ "$DRY_RUN" == "false" ]] && civo instance delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo instance ls --region=$REGION" id name)
+
+    # Volumes (incl. dangling after k8s)
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] volume: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && civo volume delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo volume ls --region=$REGION" id name)
+
+    # Databases (CLI command name varies by version)
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] database: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && {
+        civo database delete "$TARGET" --region="$REGION" -y 2>/dev/null || \
+        civo databases delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+      }
+    done < <(civo_list_rows "civo database ls --region=$REGION" id name)
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] database: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && civo databases delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo databases ls --region=$REGION" id name)
+
+    # Object stores
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] object store: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && civo objectstore delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo objectstore ls --region=$REGION" id name)
+
+    # Object store credentials
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] object store credential: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && civo objectstore credential delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo objectstore credential ls --region=$REGION" id name)
+
+    # Firewalls
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] firewall: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && civo firewall delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo firewall ls --region=$REGION" id name)
+
+    # Networks (after dependents; default may refuse)
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] network: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && civo network delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo network ls --region=$REGION" id name)
+
+    # Custom disk images (best-effort; official images usually refuse delete)
+    while IFS=$'\t' read -r ID NAME; do
+      [[ -z "${ID:-}" && -z "${NAME:-}" ]] && continue
+      local TARGET="${NAME:-$ID}"
+      echo "  [civo/$REGION] disk image: $TARGET"
+      [[ "$DRY_RUN" == "false" ]] && civo diskimage delete "$TARGET" --region="$REGION" -y 2>/dev/null || true
+    done < <(civo_list_rows "civo diskimage ls --region=$REGION" id name)
+  }
+
+  for REGION in "${REGIONS[@]}"; do
+    civo_sweep_region "$REGION"
+  done
+
+  # SSH keys, teams/permissions, and account API keys are intentionally NOT deleted.
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Dispatch
 # ══════════════════════════════════════════════════════════════════════════════
 case "$PROVIDER_TYPE" in
@@ -1749,8 +1953,9 @@ case "$PROVIDER_TYPE" in
   azure)         require_cmd az;    run_azure ;;
   gcp)           require_cmd gcloud; run_gcp ;;
   digitalocean)  require_cmd doctl; run_digitalocean ;;
+  civo)          require_cmd civo;  run_civo ;;
   *)
-    echo "Error: unsupported provider type '$PROVIDER_TYPE'. Only 'aws', 'oci', 'azure', 'gcp', and 'digitalocean' are supported." >&2
+    echo "Error: unsupported provider type '$PROVIDER_TYPE'. Only 'aws', 'oci', 'azure', 'gcp', 'digitalocean', and 'civo' are supported." >&2
     exit 1 ;;
 esac
 

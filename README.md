@@ -1,6 +1,6 @@
 # Cloud Nuke
 
-Scheduled and on-demand cleanup of billable cloud resources in AWS, OCI, Azure, GCP, and DigitalOcean accounts.
+Scheduled and on-demand cleanup of billable cloud resources in AWS, OCI, Azure, GCP, DigitalOcean, and Civo accounts.
 
 Credentials live in a GitHub secret. Which accounts are purged is controlled by a versioned config file in this repo — remove an account from the list to disable cleanup without rotating secrets.
 
@@ -54,6 +54,12 @@ Create repository secret `CLOUD_ACCOUNTS_CREDENTIALS` with JSON like [`config/cr
         "spaces_access_key": "DO00...",
         "spaces_secret_key": "..."
       }
+    },
+    "civo-lab": {
+      "provider": "civo",
+      "credentials": {
+        "civo_api_token": "..."
+      }
     }
   }
 }
@@ -65,6 +71,7 @@ Create repository secret `CLOUD_ACCOUNTS_CREDENTIALS` with JSON like [`config/cr
 - Azure uses a service principal (`subscription_id`, `tenant_id`, `client_id`, `client_secret`). Cleanup covers the **entire subscription**.
 - GCP uses a service account key JSON string (`service_account_key`). Project ID is taken from the key. Cleanup covers the **entire project**.
 - DigitalOcean uses a personal access `token` for account API resources. Spaces bucket empty/delete requires `spaces_access_key` / `spaces_secret_key` (S3-compatible); without them, Spaces buckets are skipped. Cleanup covers the **entire account**. Other Spaces access keys are deleted; the configured `spaces_access_key` is **retained**.
+- Civo uses `civo_api_token` only. Cleanup covers the **entire account** (all regions visible to the token), or a single `--region`. Object stores and object-store credentials are deleted; SSH keys, teams/permissions, and account API keys are **not**.
 
 ### 2. Enabled accounts
 
@@ -110,6 +117,8 @@ See script header in [`scripts/purge-cloud-account.sh`](scripts/purge-cloud-acco
 **GCP (entire project, or single `--region`):** GKE; MIGs and VMs; disks/snapshots/images; load balancing (forwarding rules, backends, URL maps, proxies, health checks); Cloud NAT/routers; addresses; firewalls/routes/VPN; subnets and networks (including default); Cloud SQL; Memorystore; Filestore; Artifact Registry; Cloud Run; Cloud Functions; GCS buckets. Service accounts, custom roles, IAM bindings, and workload identity pools are **not** deleted.
 
 **DigitalOcean (entire account, or single `--region`):** DOKS; Droplets; Volumes; snapshots; custom images; Load Balancers; Firewalls; Reserved IPs; VPCs; Managed Databases; Apps Platform; Container Registry repos; Spaces buckets (via Spaces keys + S3 API); Spaces access keys (**except** the `spaces_access_key` in credentials). Team members, account API tokens, and SSH keys are **not** deleted.
+
+**Civo (entire account, or single `--region`):** Kubernetes clusters; instances; volumes; instance snapshots; load balancers; firewalls; networks; databases; object stores; object-store credentials; custom disk images (best-effort). SSH keys, teams/permissions, and account API keys are **not** deleted.
 
 ## Safety
 
